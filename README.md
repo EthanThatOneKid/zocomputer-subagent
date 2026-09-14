@@ -19,3 +19,13 @@ bun run scripts/spawn.ts -- --tasks-file /absolute/path/tasks.txt --out /absolut
 ```
 
 The runner enforces a maximum of twenty children and five concurrent requests, retries transient failures, tells children not to spawn further agents, preserves result order, and writes every result or error to the JSON output file.
+
+Authentication uses `ZO_CLIENT_IDENTITY_TOKEN` unchanged when available. The explicit `ZO_SUBAGENT_API_KEY` fallback is sent as `Bearer <key>`.
+
+Run the focused tests with:
+
+```sh
+bun test scripts/spawn.test.ts
+```
+
+The runner writes results even when children fail and exits nonzero if any child result contains an error.
