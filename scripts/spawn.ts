@@ -1,7 +1,18 @@
+import { parseArgs } from "util";
+
 const endpoint = "https://api.zo.computer/zo/ask";
 const defaultModel = "openai:gpt-5.6-luna";
 const maxChildren = 20;
 const maxConcurrency = 5;
+
+type ParsedOptions = {
+  showHelp: boolean;
+  tasksFile?: string;
+  outputFile: string;
+  model: string;
+  concurrency: number;
+  timeoutSeconds: number;
+};
 
 export type Result = {
   index: number;
@@ -30,32 +41,45 @@ Each non-empty line in --tasks-file is sent as one independent child prompt.`);
   process.exit(0);
 }
 
-function flag(argv: string[], name: string, fallback = ""): string {
-  const index = argv.indexOf(name);
-  return index >= 0 ? argv[index + 1] || fallback : fallback;
-}
-
-function positiveInteger(value: string, fallback: number): number {
-  const parsed = Number.parseInt(value, 10);
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export function parseCliArgs(argv: string[]): ParsedOptions {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      help: { type: "boolean", short: "h" },
+      "tasks-file": { type: "string" },
+      out: { type: "string" },
+      model: { type: "string" },
+      concurrency: { type: "string" },
+      "timeout-seconds": { type: "string" },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+
+  return {
+    showHelp: values.help === true,
+    tasksFile: values["tasks-file"],
+    outputFile: values.out ?? "subagent-results.json",
+    model: values.model ?? defaultModel,
+    concurrency: Math.min(positiveInteger(values.concurrency, 5), maxConcurrency),
+    timeoutSeconds: positiveInteger(values["timeout-seconds"], 600),
+  };
+}
+
 async function main() {
-  const argv = Bun.argv;
-  if (argv.includes("--help") || argv.includes("-h")) usage();
+  const options = parseCliArgs(Bun.argv.slice(2));
+  if (options.showHelp) usage();
 
   const authorization = authorizationHeader();
   if (!authorization) throw new Error("Set ZO_CLIENT_IDENTITY_TOKEN or ZO_SUBAGENT_API_KEY before spawning subagents.");
+  if (!options.tasksFile) throw new Error("Missing --tasks-file.");
 
-  const tasksFile = flag(argv, "--tasks-file");
-  const outputFile = flag(argv, "--out", "subagent-results.json");
-  const model = flag(argv, "--model", defaultModel);
-  const concurrency = Math.min(positiveInteger(flag(argv, "--concurrency", "5"), maxConcurrency), maxConcurrency);
-  const timeoutSeconds = positiveInteger(flag(argv, "--timeout-seconds", "600"), 600);
-
-  if (!tasksFile) throw new Error("Missing --tasks-file.");
-
-  const tasks = (await Bun.file(tasksFile).text())
+  const tasks = (await Bun.file(options.tasksFile).text())
     .split(/\r?\n/)
     .map((task) => task.trim())
     .filter(Boolean);
@@ -76,8 +100,8 @@ async function main() {
             "content-type": "application/json",
             accept: "application/json",
           },
-          body: JSON.stringify({ input: `${leafInstruction}\n\n${prompt}`, model_name: model }),
-          signal: AbortSignal.timeout(timeoutSeconds * 1000),
+          body: JSON.stringify({ input: `${leafInstruction}\n\n${prompt}`, model_name: options.model }),
+          signal: AbortSignal.timeout(options.timeoutSeconds * 1000),
         });
         const body = await response.json().catch(() => ({}));
         if (response.ok) return { output: body.output, conversation_id: body.conversation_id };
@@ -107,10 +131,10 @@ async function main() {
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
-  await Bun.write(outputFile, JSON.stringify({ endpoint, model, count: tasks.length, results }, null, 2));
+  await Promise.all(Array.from({ length: Math.min(options.concurrency, tasks.length) }, worker));
+  await Bun.write(options.outputFile, JSON.stringify({ endpoint, model: options.model, count: tasks.length, results }, null, 2));
   const failed = failedResultCount(results);
-  console.log(JSON.stringify({ outputFile, count: tasks.length, succeeded: tasks.length - failed, failed }));
+  console.log(JSON.stringify({ outputFile: options.outputFile, count: tasks.length, succeeded: tasks.length - failed, failed }));
   if (failed > 0) process.exitCode = 1;
 }
 
