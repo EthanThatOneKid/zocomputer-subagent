@@ -4,9 +4,11 @@ import { dirname } from "node:path";
 import { parseArgs } from "util";
 
 const endpoint = "https://api.zo.computer/zo/ask";
-const defaultModel = "openai:gpt-5.6-luna";
+const defaultModel = "auto";
 const maxChildren = 20;
 const maxConcurrency = 5;
+const defaultConcurrency = 2;
+const defaultMaxAttempts = 1;
 const maxAttempts = 3;
 const defaultBatchTimeoutSeconds = 1800;
 const defaultProgressIntervalSeconds = 10;
@@ -19,7 +21,9 @@ export type ParsedOptions = {
   tasksFile?: string;
   outputFile: string;
   model: string;
+  modelExplicit: boolean;
   concurrency: number;
+  maxAttempts: number;
   timeoutSeconds: number;
   batchTimeoutSeconds: number;
   progressIntervalSeconds: number;
@@ -32,6 +36,7 @@ export type Result = {
   task_id: string;
   task_hash: string;
   prompt: string;
+  model_name: string;
   status: TaskStatus;
   attempts: number;
   queued_at: string;
@@ -48,6 +53,7 @@ export type RunState = {
   model: string;
   count: number;
   concurrency: number;
+  max_attempts: number;
   child_timeout_seconds: number;
   batch_timeout_seconds: number;
   status: RunStatus;
@@ -111,10 +117,13 @@ Options:
   --resume                       Resume from the existing --out file
   --resume-from <path>           Resume from this results file
   --retry-succeeded              Re-run successful tasks while resuming
-  --concurrency <n>              Concurrent children, capped at 5
-  --model <model>                Zo model name
+  --concurrency <n>              Concurrent children, capped at 5 (default: 2)
+  --max-attempts <n>              HTTP attempts per child, capped at 3 (default: 1)
+  --model <model>                Fallback Zo model name (default: auto)
 
-A resume skips successful tasks by default and retries failed, timed-out, cancelled,
+Each task may be plain text or JSONL with {"prompt":"...","model":"..."}.
+A task model overrides --model. A resume skips successful tasks only when their
+prompt and requested model are unchanged; it retries failed, timed-out, cancelled,
 and previously running tasks. The runner aborts its local HTTP requests on timeout or
 cancellation; the remote child may continue running if the server already accepted it.`);
   process.exit(0);
@@ -134,6 +143,7 @@ export function parseCliArgs(argv: string[]): ParsedOptions {
       out: { type: "string" },
       model: { type: "string" },
       concurrency: { type: "string" },
+      "max-attempts": { type: "string" },
       "timeout-seconds": { type: "string" },
       "batch-timeout-seconds": { type: "string" },
       "progress-interval-seconds": { type: "string" },
@@ -151,7 +161,9 @@ export function parseCliArgs(argv: string[]): ParsedOptions {
     tasksFile: values["tasks-file"],
     outputFile,
     model: values.model ?? defaultModel,
-    concurrency: Math.min(positiveInteger(values.concurrency, 5), maxConcurrency),
+    modelExplicit: values.model !== undefined,
+    concurrency: Math.min(positiveInteger(values.concurrency, defaultConcurrency), maxConcurrency),
+    maxAttempts: Math.min(positiveInteger(values["max-attempts"], defaultMaxAttempts), maxAttempts),
     timeoutSeconds: positiveInteger(values["timeout-seconds"], 600),
     batchTimeoutSeconds: positiveInteger(values["batch-timeout-seconds"], defaultBatchTimeoutSeconds),
     progressIntervalSeconds: positiveInteger(values["progress-interval-seconds"], defaultProgressIntervalSeconds),
@@ -203,7 +215,32 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   await rename(temporaryPath, path);
 }
 
-function normalizeResult(value: Partial<Result>, index: number, prompt: string): Result {
+export type TaskSpec = { prompt: string; model?: string };
+
+export function parseTaskLine(line: string, lineNumber = 1): TaskSpec | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+  if (!trimmed.startsWith("{")) return { prompt: trimmed };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`Invalid JSON task on line ${lineNumber}: ${errorMessage(error)}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Task on line ${lineNumber} must be a JSON object with a string prompt.`);
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.prompt !== "string" || !record.prompt.trim()) {
+    throw new Error(`Task on line ${lineNumber} must include a non-empty string prompt.`);
+  }
+  if (record.model !== undefined && (typeof record.model !== "string" || !record.model.trim())) {
+    throw new Error(`Task model on line ${lineNumber} must be a non-empty string.`);
+  }
+  return { prompt: record.prompt, model: typeof record.model === "string" ? record.model.trim() : undefined };
+}
+
+function normalizeResult(value: Partial<Result>, index: number, prompt: string, modelName: string, legacyModelName: string): Result {
   const status = value.status ?? (value.error ? "failed" : "succeeded");
   const storedPrompt = typeof value.prompt === "string" ? value.prompt : prompt;
   return {
@@ -211,6 +248,7 @@ function normalizeResult(value: Partial<Result>, index: number, prompt: string):
     task_id: value.task_id ?? taskId(index, storedPrompt),
     task_hash: value.task_hash ?? taskHash(storedPrompt),
     prompt,
+    model_name: typeof value.model_name === "string" ? value.model_name : legacyModelName || modelName,
     status,
     attempts: value.attempts ?? (status === "queued" ? 0 : 1),
     queued_at: value.queued_at ?? timestamp(),
@@ -236,12 +274,12 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
 
   const tasks = (await Bun.file(options.tasksFile).text())
     .split(/\r?\n/)
-    .map((task) => task.trim())
-    .filter(Boolean);
+    .map((line, index) => parseTaskLine(line, index + 1))
+    .filter((task): task is TaskSpec => task !== undefined);
   if (tasks.length === 0) throw new Error("The tasks file contains no non-empty prompts.");
   if (tasks.length > maxChildren) throw new Error(`Refusing to spawn ${tasks.length} children; the limit is ${maxChildren}.`);
 
-  let previous: { results?: Partial<Result>[] } | undefined;
+  let previous: { model?: string; results?: Partial<Result>[] } | undefined;
   if (options.resumeFile) {
     const resumePath = options.resumeFile;
     if (!(await Bun.file(resumePath).exists())) throw new Error(`Cannot resume; results file does not exist: ${resumePath}`);
@@ -256,10 +294,12 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
   }
 
   const startedAt = timestamp();
-  const results = tasks.map((prompt, index) => {
+  const batchModel = options.modelExplicit ? options.model : previous?.model ?? options.model;
+  const results = tasks.map((task, index) => {
     const old = previous?.results?.[index];
-    const result = normalizeResult(old ?? {}, index, prompt);
-    const sameTask = result.task_hash === taskHash(prompt) && result.prompt === prompt;
+    const modelName = task.model ?? batchModel;
+    const result = normalizeResult(old ?? {}, index, task.prompt, modelName, previous?.model ?? options.model);
+    const sameTask = result.task_hash === taskHash(task.prompt) && result.prompt === task.prompt && result.model_name === modelName;
     if (!old || !sameTask || result.status !== "succeeded" || options.retrySucceeded) {
       result.status = "queued";
       if (!old || !sameTask) result.attempts = 0;
@@ -269,17 +309,19 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
       result.output = undefined;
       result.conversation_id = undefined;
     }
-    result.task_id = taskId(index, prompt);
-    result.task_hash = taskHash(prompt);
+    result.task_id = taskId(index, task.prompt);
+    result.task_hash = taskHash(task.prompt);
+    result.model_name = modelName;
     return result;
   });
 
   const state: RunState = {
     version: 1,
     endpoint,
-    model: options.model,
+    model: batchModel,
     count: tasks.length,
     concurrency: Math.min(options.concurrency, tasks.length, maxConcurrency),
+    max_attempts: options.maxAttempts,
     child_timeout_seconds: options.timeoutSeconds,
     batch_timeout_seconds: options.batchTimeoutSeconds,
     status: "running",
@@ -334,7 +376,7 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
 
   const ask = async (prompt: string, index: number): Promise<{ output: unknown; conversation_id?: string }> => {
     let lastError = "Unknown error";
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    for (let attempt = 0; attempt < options.maxAttempts; attempt += 1) {
       if (batchController.signal.aborted) throw batchController.signal.reason ?? new RunnerCancelledError();
       const result = state.results[index];
       result.attempts += 1;
@@ -356,7 +398,7 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
             "content-type": "application/json",
             accept: "application/json",
           },
-          body: JSON.stringify({ input: `${leafInstruction}\n\n${prompt}`, model_name: options.model }),
+          body: JSON.stringify({ input: `${leafInstruction}\n\n${prompt}`, model_name: state.results[index].model_name }),
           signal: childController.signal,
         });
         const body = await response.json().catch(() => ({}));
@@ -372,7 +414,7 @@ export async function runBatch(options: ParsedOptions, authorization: string, de
         clearTimeout(timeoutTimer);
         if (onBatchAbort) batchController.signal.removeEventListener("abort", onBatchAbort);
       }
-      if (attempt + 1 < maxAttempts) await sleepWithSignal(750 * 2 ** attempt, batchController.signal, sleep);
+      if (attempt + 1 < options.maxAttempts) await sleepWithSignal(750 * 2 ** attempt, batchController.signal, sleep);
     }
     throw new Error(lastError);
   };
