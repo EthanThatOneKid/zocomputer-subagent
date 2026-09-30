@@ -197,7 +197,14 @@ function sleepWithSignal(milliseconds: number, signal: AbortSignal, sleep: (mill
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
+  // On Windows, Bun's mkdir(..., { recursive: true }) throws EEXIST when the
+  // directory already exists, so an already-present parent must be tolerated.
+  // Re-throw anything else: a real permission or path failure is not benign.
+  try {
+    await mkdir(dirname(path), { recursive: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
   const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   await Bun.write(temporaryPath, contents);
   await rename(temporaryPath, path);
